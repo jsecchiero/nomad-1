@@ -58,9 +58,12 @@ type PrestartResponse struct {
 	// CreatedResources by the driver.
 	CreatedResources *CreatedResources
 
-	// PortMap can be set by drivers to replace ports in environment
-	// variables with driver-specific mappings.
-	PortMap map[string]int
+	// DriverNetwork contains driver-specific network parameters such as
+	// the port map between the host and a container.
+	//
+	// Network may be nil as not all drivers or configurations create
+	// networks.
+	Network *cstructs.DriverNetwork
 }
 
 // NewPrestartResponse creates a new PrestartResponse with CreatedResources
@@ -208,7 +211,7 @@ type Driver interface {
 	//
 	// If Cleanup returns a recoverable error it may be retried. On retry
 	// it will be passed the same CreatedResources, so all successfully
-	// cleaned up resources should be removed.
+	// cleaned up resources should be removed or handled idempotently.
 	Cleanup(*ExecContext, *CreatedResources) error
 
 	// Drivers must validate their configuration

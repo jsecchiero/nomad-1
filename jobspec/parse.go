@@ -905,6 +905,7 @@ func parseServices(jobName string, taskGroupName string, task *api.Task, service
 			"tags",
 			"port",
 			"check",
+			"address_mode",
 		}
 		if err := checkHCLKeys(o.Val, valid); err != nil {
 			return multierror.Prefix(err, fmt.Sprintf("service (%d) ->", idx))
@@ -920,6 +921,14 @@ func parseServices(jobName string, taskGroupName string, task *api.Task, service
 
 		if err := mapstructure.WeakDecode(m, &service); err != nil {
 			return err
+		}
+
+		//TODO import modes from nomad/structs?
+		switch service.AddressMode {
+		case "auto", "host", "driver":
+			// OK
+		default:
+			return fmt.Errorf("service 'address_mode': invalid address mode %q", service.AddressMode)
 		}
 
 		// Filter checks

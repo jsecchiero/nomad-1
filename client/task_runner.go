@@ -351,7 +351,8 @@ func (r *TaskRunner) RestoreState() (string, error) {
 			restartReason = pre06ScriptCheckReason
 		}
 
-		if err := r.registerServices(d, handle); err != nil {
+		//FIXME don't pass nil here
+		if err := r.registerServices(d, handle, nil); err != nil {
 			// Don't hard fail here as there's a chance this task
 			// registered with Consul properly when it initial
 			// started.
@@ -1311,10 +1312,8 @@ func (r *TaskRunner) startTask() error {
 		r.createdResources.Merge(resp.CreatedResources)
 		r.createdResourcesLock.Unlock()
 
-		// Update environment with PortMap if it was returned
-		if len(resp.PortMap) > 0 {
-			r.envBuilder.SetPortMap(resp.PortMap)
-		}
+		// Update environment with the network defined by the driver for the task
+		r.envBuilder.SetDriverNetwork(resp.Network)
 	}
 
 	if err != nil {
@@ -1337,7 +1336,7 @@ func (r *TaskRunner) startTask() error {
 
 	}
 
-	if err := r.registerServices(drv, handle); err != nil {
+	if err := r.registerServices(drv, handle, resp.Network); err != nil {
 		// All IO is done asynchronously, so errors from registering
 		// services are hard failures.
 		r.logger.Printf("[ERR] client: failed to register services and checks for task %q alloc %q: %v", r.task.Name, r.alloc.ID, err)
@@ -1358,14 +1357,14 @@ func (r *TaskRunner) startTask() error {
 }
 
 // registerServices and checks with Consul.
-func (r *TaskRunner) registerServices(d driver.Driver, h driver.ScriptExecutor) error {
+func (r *TaskRunner) registerServices(d driver.Driver, h driver.DriverHandle, n *cstructs.DriverNetwork) error {
 	var exec driver.ScriptExecutor
 	if d.Abilities().Exec {
 		// Allow set the script executor if the driver supports it
 		exec = h
 	}
 	interpolateServices(r.envBuilder.Build(), r.task)
-	return r.consul.RegisterTask(r.alloc.ID, r.task, exec)
+	return r.consul.RegisterTask(r.alloc.ID, r.task, exec, n)
 }
 
 // interpolateServices interpolates tags in a service and checks with values from the
