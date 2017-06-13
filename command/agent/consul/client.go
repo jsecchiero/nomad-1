@@ -472,7 +472,12 @@ func (c *ServiceClient) serviceRegs(ops *operations, allocID string, service *st
 
 		// Checks should always use the host ip:port
 		//FIXME right?!
-		ip, port := task.Resources.Networks.Port(check.PortLabel)
+		portLabel := check.PortLabel
+		if portLabel == "" {
+			// Default to the service's port label
+			portLabel = service.PortLabel
+		}
+		ip, port := task.Resources.Networks.Port(portLabel)
 		checkReg, err := createCheckReg(id, checkID, check, ip, port)
 		if err != nil {
 			return fmt.Errorf("failed to add check %q: %v", check.Name, err)
