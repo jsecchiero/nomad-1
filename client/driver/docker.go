@@ -116,9 +116,6 @@ type DockerDriver struct {
 
 	driverConfig *DockerDriverConfig
 	imageID      string
-	container    *docker.Container
-	exec         executor.Executor
-	pluginClient *plugin.Client
 
 	// A tri-state boolean to know if the fingerprinting has happened and
 	// whether it has been successful
@@ -474,7 +471,7 @@ func (d *DockerDriver) Prestart(ctx *ExecContext, task *structs.Task) (*Prestart
 		return nil, err
 	}
 
-	// Set state needed by Start()
+	// Set state needed by Start
 	d.driverConfig = driverConfig
 
 	// Initialize docker API clients
@@ -492,6 +489,10 @@ func (d *DockerDriver) Prestart(ctx *ExecContext, task *structs.Task) (*Prestart
 	resp := NewPrestartResponse()
 	resp.CreatedResources.Add(dockerImageResKey, id)
 	d.imageID = id
+	return resp, nil
+}
+
+func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse, error) {
 
 	pluginLogFile := filepath.Join(ctx.TaskDir.Dir, "executor.out")
 	executorConfig := &dstructs.ExecutorConfig{
@@ -499,7 +500,7 @@ func (d *DockerDriver) Prestart(ctx *ExecContext, task *structs.Task) (*Prestart
 		LogLevel: d.config.LogLevel,
 	}
 
-	d.exec, d.pluginClient, err = createExecutor(d.config.LogOutput, d.config, executorConfig)
+	exec, pluginClient, err := createExecutor(d.config.LogOutput, d.config, executorConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -513,8 +514,8 @@ func (d *DockerDriver) Prestart(ctx *ExecContext, task *structs.Task) (*Prestart
 		PortLowerBound: d.config.ClientMinPort,
 		PortUpperBound: d.config.ClientMaxPort,
 	}
-	if err := d.exec.SetContext(executorCtx); err != nil {
-		d.pluginClient.Kill()
+	if err := exec.SetContext(executorCtx); err != nil {
+		pluginClient.Kill()
 		return nil, fmt.Errorf("failed to set executor context: %v", err)
 	}
 
@@ -523,9 +524,9 @@ func (d *DockerDriver) Prestart(ctx *ExecContext, task *structs.Task) (*Prestart
 	if runtime.GOOS == "darwin" && len(d.driverConfig.Logging) == 0 {
 		d.logger.Printf("[DEBUG] driver.docker: disabling syslog driver as Docker for Mac workaround")
 	} else if len(d.driverConfig.Logging) == 0 || d.driverConfig.Logging[0].Type == "syslog" {
-		ss, err := d.exec.LaunchSyslogServer()
+		ss, err := exec.LaunchSyslogServer()
 		if err != nil {
-			d.pluginClient.Kill()
+			pluginClient.Kill()
 			return nil, fmt.Errorf("failed to start syslog collector: %v", err)
 		}
 		syslogAddr = ss.Addr
@@ -534,25 +535,76 @@ func (d *DockerDriver) Prestart(ctx *ExecContext, task *structs.Task) (*Prestart
 	config, err := d.createContainerConfig(ctx, task, d.driverConfig, syslogAddr)
 	if err != nil {
 		d.logger.Printf("[ERR] driver.docker: failed to create container configuration for image %q (%q): %v", d.driverConfig.ImageName, d.imageID, err)
-		d.pluginClient.Kill()
+		pluginClient.Kill()
 		return nil, fmt.Errorf("Failed to create container configuration for image %q (%q): %v", d.driverConfig.ImageName, d.imageID, err)
 	}
 
-	d.container, err = d.createContainer(config)
+	container, err := d.createContainer(config)
 	if err != nil {
 		wrapped := fmt.Sprintf("Failed to create container: %v", err)
 		d.logger.Printf("[ERR] driver.docker: %s", wrapped)
-		d.pluginClient.Kill()
+		pluginClient.Kill()
 		return nil, structs.WrapRecoverable(wrapped, err)
 	}
 
-	d.logger.Printf("[INFO] driver.docker: created container %s", d.container.ID)
+	d.logger.Printf("[INFO] driver.docker: created container %s", container.ID)
 
-	ip, autoUse := d.detectIP(d.container)
-	resp.Network = &cstructs.DriverNetwork{
-		PortMap:   d.driverConfig.PortMap,
-		IP:        ip,
-		AutoUseIP: autoUse,
+	// We don't need to start the container if the container is already running
+	// since we don't create containers which are already present on the host
+	// and are running
+	if !container.State.Running {
+		// Start the container
+		if err := d.startContainer(container); err != nil {
+			d.logger.Printf("[ERR] driver.docker: failed to start container %s: %s", container.ID, err)
+			pluginClient.Kill()
+			return nil, fmt.Errorf("Failed to start container %s: %s", container.ID, err)
+		}
+		// InspectContainer to get all of the container metadata as
+		// much of the metadata (eg networking) isn't populated until
+		// the container is started
+		if container, err = client.InspectContainer(container.ID); err != nil {
+			err = fmt.Errorf("failed to inspect started container %s: %s", container.ID, err)
+			d.logger.Printf("[ERR] driver.docker: %v", err)
+			pluginClient.Kill()
+			return nil, structs.NewRecoverableError(err, true)
+		}
+		d.logger.Printf("[INFO] driver.docker: started container %s", container.ID)
+	} else {
+		d.logger.Printf("[DEBUG] driver.docker: re-attaching to container %s with status %q",
+			container.ID, container.State.String())
+	}
+
+	// Return a driver handle
+	maxKill := d.DriverContext.config.MaxKillTimeout
+	h := &DockerHandle{
+		client:         client,
+		waitClient:     waitClient,
+		executor:       exec,
+		pluginClient:   pluginClient,
+		logger:         d.logger,
+		Image:          d.driverConfig.ImageName,
+		ImageID:        d.imageID,
+		containerID:    container.ID,
+		version:        d.config.Version,
+		killTimeout:    GetKillTimeout(task.KillTimeout, maxKill),
+		maxKillTimeout: maxKill,
+		doneCh:         make(chan bool),
+		waitCh:         make(chan *dstructs.WaitResult, 1),
+	}
+	go h.collectStats()
+	go h.run()
+
+	// Detect container address
+	ip, autoUse := d.detectIP(container)
+
+	// Create a response with the driver handle and container network metadata
+	resp := &StartResponse{
+		Handle: h,
+		Network: &cstructs.DriverNetwork{
+			PortMap:   d.driverConfig.PortMap,
+			IP:        ip,
+			AutoUseIP: autoUse,
+		},
 	}
 	return resp, nil
 }
@@ -569,7 +621,6 @@ func (d *DockerDriver) detectIP(c *docker.Container) (string, bool) {
 	n := 0
 	auto := false
 	for name, net := range c.NetworkSettings.Networks {
-		d.logger.Printf("[DEBUG] driver.docker: XXXXXXXXXXXX  network %s: %#v", name, net)
 		if net.IPAddress == "" {
 			// Ignore networks without an IP address
 			continue
@@ -587,46 +638,6 @@ func (d *DockerDriver) detectIP(c *docker.Container) (string, bool) {
 		d.logger.Printf("[WARN] driver.docker: multiple (%d) Docker networks for container %q but Nomad only supports 1: choosing %q", n, c.ID, ipName)
 	}
 	return ip, auto
-}
-
-func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
-	time.Sleep(15 * time.Second)
-	// We don't need to start the container if the container is already running
-	// since we don't create containers which are already present on the host
-	// and are running
-	if !d.container.State.Running {
-		// Start the container
-		if err := d.startContainer(d.container); err != nil {
-			d.logger.Printf("[ERR] driver.docker: failed to start container %s: %s", d.container.ID, err)
-			d.pluginClient.Kill()
-			return nil, fmt.Errorf("Failed to start container %s: %s", d.container.ID, err)
-		}
-		d.logger.Printf("[INFO] driver.docker: started container %s", d.container.ID)
-	} else {
-		d.logger.Printf("[DEBUG] driver.docker: re-attaching to container %s with status %q",
-			d.container.ID, d.container.State.String())
-	}
-
-	// Return a driver handle
-	maxKill := d.DriverContext.config.MaxKillTimeout
-	h := &DockerHandle{
-		client:         client,
-		waitClient:     waitClient,
-		executor:       d.exec,
-		pluginClient:   d.pluginClient,
-		logger:         d.logger,
-		Image:          d.driverConfig.ImageName,
-		ImageID:        d.imageID,
-		containerID:    d.container.ID,
-		version:        d.config.Version,
-		killTimeout:    GetKillTimeout(task.KillTimeout, maxKill),
-		maxKillTimeout: maxKill,
-		doneCh:         make(chan bool),
-		waitCh:         make(chan *dstructs.WaitResult, 1),
-	}
-	go h.collectStats()
-	go h.run()
-	return h, nil
 }
 
 func (d *DockerDriver) Cleanup(_ *ExecContext, res *CreatedResources) error {
@@ -1117,9 +1128,7 @@ func (d *DockerDriver) createContainer(config docker.CreateContainerOptions) (*d
 CREATE:
 	container, createErr := client.CreateContainer(config)
 	if createErr == nil {
-		// The container returned by CreateContainer only contains the
-		// ID. Call InspectContainer to get all of the metadata.
-		return client.InspectContainer(container.ID)
+		return container, nil
 	}
 
 	d.logger.Printf("[DEBUG] driver.docker: failed to create container %q from image %q (ID: %q) (attempt %d): %v",

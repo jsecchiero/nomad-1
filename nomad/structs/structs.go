@@ -2539,6 +2539,13 @@ func (s *Service) Validate() error {
 		mErr.Errors = append(mErr.Errors, fmt.Errorf("service name must be valid per RFC 1123 and can contain only alphanumeric characters or dashes: %q", s.Name))
 	}
 
+	switch s.AddressMode {
+	case AddressModeAuto, AddressModeHost, AddressModeDriver:
+		// OK
+	default:
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("service address_mode must be %q, %q, or %q; not %q", AddressModeAuto, AddressModeHost, AddressModeDriver, s.AddressMode))
+	}
+
 	for _, c := range s.Checks {
 		if s.PortLabel == "" && c.RequiresPort() {
 			mErr.Errors = append(mErr.Errors, fmt.Errorf("check %s invalid: check requires a port but the service %+q has no port", c.Name, s.Name))
@@ -2916,6 +2923,8 @@ func validateServices(t *Task) error {
 			mErr.Errors = append(mErr.Errors, err)
 		}
 	}
+
+	// Ensure address mode is valid
 	return mErr.ErrorOrNil()
 }
 

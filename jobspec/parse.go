@@ -923,14 +923,6 @@ func parseServices(jobName string, taskGroupName string, task *api.Task, service
 			return err
 		}
 
-		//TODO import modes from nomad/structs?
-		switch service.AddressMode {
-		case "auto", "host", "driver":
-			// OK
-		default:
-			return fmt.Errorf("service 'address_mode': invalid address mode %q", service.AddressMode)
-		}
-
 		// Filter checks
 		var checkList *ast.ObjectList
 		if ot, ok := o.Val.(*ast.ObjectType); ok {
