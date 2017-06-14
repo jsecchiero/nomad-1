@@ -108,34 +108,37 @@ func dockerSetupWithClient(t *testing.T, task *structs.Task, client *docker.Clie
 	driver := NewDockerDriver(tctx.DriverCtx)
 	copyImage(t, tctx.ExecCtx.TaskDir, "busybox.tar")
 
-	resp, err := driver.Prestart(tctx.ExecCtx, task)
+	presp, err := driver.Prestart(tctx.ExecCtx, task)
 	if err != nil {
+		driver.Cleanup(tctx.ExecCtx, presp.CreatedResources)
 		tctx.AllocDir.Destroy()
 		t.Fatalf("error in prestart: %v", err)
 	}
 
-	// At runtime this is handled by TaskRunner
-	tctx.EnvBuilder.SetPortMap(resp.PortMap)
-	tctx.ExecCtx.TaskEnv = tctx.EnvBuilder.Build()
-
-	handle, err := driver.Start(tctx.ExecCtx, task)
+	sresp, err := driver.Start(tctx.ExecCtx, task)
 	if err != nil {
+		driver.Cleanup(tctx.ExecCtx, presp.CreatedResources)
 		tctx.AllocDir.Destroy()
 		t.Fatalf("Failed to start driver: %s\nStack\n%s", err, debug.Stack())
 	}
 
-	if handle == nil {
+	if sresp.Handle == nil {
+		driver.Cleanup(tctx.ExecCtx, presp.CreatedResources)
 		tctx.AllocDir.Destroy()
 		t.Fatalf("handle is nil\nStack\n%s", debug.Stack())
 	}
 
+	// At runtime this is handled by TaskRunner
+	tctx.EnvBuilder.SetDriverNetwork(sresp.Network)
+	tctx.ExecCtx.TaskEnv = tctx.EnvBuilder.Build()
+
 	cleanup := func() {
-		driver.Cleanup(tctx.ExecCtx, resp.CreatedResources)
-		handle.Kill()
+		driver.Cleanup(tctx.ExecCtx, presp.CreatedResources)
+		sresp.Handle.Kill()
 		tctx.AllocDir.Destroy()
 	}
 
-	return client, handle, cleanup
+	return client, sresp.Handle, cleanup
 }
 
 func newTestDockerClient(t *testing.T) *docker.Client {
@@ -204,21 +207,21 @@ func TestDockerDriver_StartOpen_Wait(t *testing.T) {
 		t.Fatalf("error in prestart: %v", err)
 	}
 
-	handle, err := d.Start(ctx.ExecCtx, task)
+	resp, err := d.Start(ctx.ExecCtx, task)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if handle == nil {
+	if resp.Handle == nil {
 		t.Fatalf("missing handle")
 	}
-	defer handle.Kill()
+	defer resp.Handle.Kill()
 
 	// Attempt to open
-	handle2, err := d.Open(ctx.ExecCtx, handle.ID())
+	resp2, err := d.Open(ctx.ExecCtx, resp.Handle.ID())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if handle2 == nil {
+	if resp2 == nil {
 		t.Fatalf("missing handle")
 	}
 }
@@ -299,17 +302,14 @@ func TestDockerDriver_Start_LoadImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error in prestart: %v", err)
 	}
-	handle, err := d.Start(ctx.ExecCtx, task)
+	resp, err := d.Start(ctx.ExecCtx, task)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if handle == nil {
-		t.Fatalf("missing handle")
-	}
-	defer handle.Kill()
+	defer resp.Handle.Kill()
 
 	select {
-	case res := <-handle.WaitCh():
+	case res := <-resp.Handle.WaitCh():
 		if !res.Successful() {
 			t.Fatalf("err: %v", res)
 		}
@@ -415,17 +415,14 @@ func TestDockerDriver_Start_Wait_AllocDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error in prestart: %v", err)
 	}
-	handle, err := d.Start(ctx.ExecCtx, task)
+	resp, err := d.Start(ctx.ExecCtx, task)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if handle == nil {
-		t.Fatalf("missing handle")
-	}
-	defer handle.Kill()
+	defer resp.Handle.Kill()
 
 	select {
-	case res := <-handle.WaitCh():
+	case res := <-resp.Handle.WaitCh():
 		if !res.Successful() {
 			t.Fatalf("err: %v", res)
 		}
@@ -509,10 +506,12 @@ func TestDockerDriver_StartN(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error in prestart #%d: %v", idx+1, err)
 		}
-		handles[idx], err = d.Start(ctx.ExecCtx, task)
+		resp, err := d.Start(ctx.ExecCtx, task)
 		if err != nil {
 			t.Errorf("Failed starting task #%d: %s", idx+1, err)
+			continue
 		}
+		handles[idx] = resp.Handle
 	}
 
 	t.Log("All tasks are started. Terminating...")
@@ -569,10 +568,12 @@ func TestDockerDriver_StartNVersions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error in prestart #%d: %v", idx+1, err)
 		}
-		handles[idx], err = d.Start(ctx.ExecCtx, task)
+		resp, err := d.Start(ctx.ExecCtx, task)
 		if err != nil {
 			t.Errorf("Failed starting task #%d: %s", idx+1, err)
+			continue
 		}
+		handles[idx] = resp.Handle
 	}
 
 	t.Log("All tasks are started. Terminating...")
@@ -963,9 +964,9 @@ func TestDockerDriver_User(t *testing.T) {
 
 	// It should fail because the user "alice" does not exist on the given
 	// image.
-	handle, err := driver.Start(ctx.ExecCtx, task)
+	resp, err := driver.Start(ctx.ExecCtx, task)
 	if err == nil {
-		handle.Kill()
+		resp.Handle.Kill()
 		t.Fatalf("Should've failed")
 	}
 
@@ -1164,14 +1165,14 @@ func TestDockerDriver_VolumesDisabled(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error in prestart: %v", err)
 		}
-		handle, err := driver.Start(execCtx, task)
+		resp, err := driver.Start(execCtx, task)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-		defer handle.Kill()
+		defer resp.Handle.Kill()
 
 		select {
-		case res := <-handle.WaitCh():
+		case res := <-resp.Handle.WaitCh():
 			if !res.Successful() {
 				t.Fatalf("unexpected err: %v", res)
 			}
@@ -1215,14 +1216,14 @@ func TestDockerDriver_VolumesEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error in prestart: %v", err)
 	}
-	handle, err := driver.Start(execCtx, task)
+	resp, err := driver.Start(execCtx, task)
 	if err != nil {
 		t.Fatalf("Failed to start docker driver: %v", err)
 	}
-	defer handle.Kill()
+	defer resp.Handle.Kill()
 
 	select {
-	case res := <-handle.WaitCh():
+	case res := <-resp.Handle.WaitCh():
 		if !res.Successful() {
 			t.Fatalf("unexpected err: %v", res)
 		}
