@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -114,6 +115,8 @@ func dockerSetupWithClient(t *testing.T, task *structs.Task, client *docker.Clie
 		tctx.AllocDir.Destroy()
 		t.Fatalf("error in prestart: %v", err)
 	}
+	// Update the exec ctx with the driver network env vars
+	tctx.ExecCtx.TaskEnv = tctx.EnvBuilder.SetDriverNetwork(presp.Network).Build()
 
 	sresp, err := driver.Start(tctx.ExecCtx, task)
 	if err != nil {
@@ -918,6 +921,7 @@ func TestDockerDriver_PortsMapping(t *testing.T) {
 		"NOMAD_HOST_PORT_main": strconv.Itoa(docker_reserved),
 	}
 
+	sort.Strings(container.Config.Env)
 	for key, val := range expectedEnvironment {
 		search := fmt.Sprintf("%s=%s", key, val)
 		if !inSlice(search, container.Config.Env) {
