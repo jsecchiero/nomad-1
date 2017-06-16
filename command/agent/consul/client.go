@@ -297,8 +297,10 @@ func (c *ServiceClient) sync() error {
 			// Known check, leave it
 			continue
 		}
+		//FIXME In 0.7 change this to the check's ID as the Nomad
+		//      prefix was added to check IDs in 0.6.
 		if !isNomadService(check.ServiceID) {
-			// Not managed by Nomad, skip
+			// Service not managed by Nomad, skip
 			continue
 		}
 		// Unknown Nomad managed check; kill
@@ -687,7 +689,7 @@ func makeTaskServiceID(allocID, taskName string, service *structs.Service) strin
 
 // makeCheckID creates a unique ID for a check.
 func makeCheckID(serviceID string, check *structs.ServiceCheck) string {
-	return check.Hash(serviceID)
+	return fmt.Sprintf("%s-%s", nomadServicePrefix, check.Hash(serviceID))
 }
 
 // createCheckReg creates a Check that can be registered with Consul.
