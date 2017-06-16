@@ -273,7 +273,10 @@ func (c *ServiceClient) sync() error {
 	// Add Nomad services missing from Consul
 	for id, locals := range c.services {
 		if remotes, ok := consulServices[id]; ok {
-			if locals.Port == remotes.Port {
+			// Make sure Port and Address are stable since
+			// PortLabel and AddressMode aren't included in the
+			// service ID.
+			if locals.Port == remotes.Port && locals.Address == remotes.Address {
 				// Already exists in Consul; skip
 				continue
 			}
@@ -370,7 +373,7 @@ func (c *ServiceClient) RegisterAgent(role string, services []*structs.Service) 
 		ops.regServices = append(ops.regServices, serviceReg)
 
 		for _, check := range service.Checks {
-			checkID := createCheckID(id, check)
+			checkID := makeCheckID(id, check)
 			if check.Type == structs.ServiceCheckScript {
 				return fmt.Errorf("service %q contains invalid check: agent checks do not support scripts", service.Name)
 			}
@@ -460,7 +463,7 @@ func (c *ServiceClient) serviceRegs(ops *operations, allocID string, service *st
 				check.Name, task.Name, allocID)
 			continue
 		}
-		checkID := createCheckID(id, check)
+		checkID := makeCheckID(id, check)
 		if check.Type == structs.ServiceCheckScript {
 			if exec == nil {
 				return fmt.Errorf("driver doesn't support script checks")
@@ -507,7 +510,9 @@ func (c *ServiceClient) RegisterTask(allocID string, task *structs.Task, exec dr
 
 // UpdateTask in Consul. Does not alter the service if only checks have
 // changed.
-func (c *ServiceClient) UpdateTask(allocID string, existing, newTask *structs.Task, exec driver.ScriptExecutor) error {
+//
+// DriverNetwork must not change between invocations for the same allocation.
+func (c *ServiceClient) UpdateTask(allocID string, existing, newTask *structs.Task, exec driver.ScriptExecutor, net *cstructs.DriverNetwork) error {
 	ops := &operations{}
 
 	existingIDs := make(map[string]*structs.Service, len(existing.Services))
@@ -527,12 +532,14 @@ func (c *ServiceClient) UpdateTask(allocID string, existing, newTask *structs.Ta
 			// Existing sevice entry removed
 			ops.deregServices = append(ops.deregServices, existingID)
 			for _, check := range existingSvc.Checks {
-				ops.deregChecks = append(ops.deregChecks, createCheckID(existingID, check))
+				ops.deregChecks = append(ops.deregChecks, makeCheckID(existingID, check))
 			}
 			continue
 		}
 
-		if newSvc.PortLabel == existingSvc.PortLabel {
+		// PortLabel and AddressMode aren't included in the ID, so we
+		// have to compare manually.
+		if newSvc.PortLabel == existingSvc.PortLabel && newSvc.AddressMode == existingSvc.AddressMode {
 			// Service exists and hasn't changed, don't add it later
 			delete(newIDs, existingID)
 		}
@@ -540,12 +547,12 @@ func (c *ServiceClient) UpdateTask(allocID string, existing, newTask *structs.Ta
 		// Check to see what checks were updated
 		existingChecks := make(map[string]struct{}, len(existingSvc.Checks))
 		for _, check := range existingSvc.Checks {
-			existingChecks[createCheckID(existingID, check)] = struct{}{}
+			existingChecks[makeCheckID(existingID, check)] = struct{}{}
 		}
 
 		// Register new checks
 		for _, check := range newSvc.Checks {
-			checkID := createCheckID(existingID, check)
+			checkID := makeCheckID(existingID, check)
 			if _, exists := existingChecks[checkID]; exists {
 				// Check exists, so don't remove it
 				delete(existingChecks, checkID)
@@ -560,8 +567,7 @@ func (c *ServiceClient) UpdateTask(allocID string, existing, newTask *structs.Ta
 
 	// Any remaining services should just be enqueued directly
 	for _, newSvc := range newIDs {
-		//FIXME driver.Network needed
-		err := c.serviceRegs(ops, allocID, newSvc, newTask, exec, nil)
+		err := c.serviceRegs(ops, allocID, newSvc, newTask, exec, net)
 		if err != nil {
 			return err
 		}
@@ -582,7 +588,7 @@ func (c *ServiceClient) RemoveTask(allocID string, task *structs.Task) {
 		ops.deregServices = append(ops.deregServices, id)
 
 		for _, check := range service.Checks {
-			ops.deregChecks = append(ops.deregChecks, createCheckID(id, check))
+			ops.deregChecks = append(ops.deregChecks, makeCheckID(id, check))
 		}
 	}
 
@@ -679,8 +685,8 @@ func makeTaskServiceID(allocID, taskName string, service *structs.Service) strin
 	return strings.Join(parts, "-")
 }
 
-// createCheckID creates a unique ID for a check.
-func createCheckID(serviceID string, check *structs.ServiceCheck) string {
+// makeCheckID creates a unique ID for a check.
+func makeCheckID(serviceID string, check *structs.ServiceCheck) string {
 	return check.Hash(serviceID)
 }
 

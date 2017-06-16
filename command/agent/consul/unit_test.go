@@ -241,7 +241,7 @@ func TestConsul_ChangeTags(t *testing.T) {
 	origTask := ctx.Task
 	ctx.Task = testTask()
 	ctx.Task.Services[0].Tags[0] = "newtag"
-	if err := ctx.ServiceClient.UpdateTask("allocid", origTask, ctx.Task, nil); err != nil {
+	if err := ctx.ServiceClient.UpdateTask("allocid", origTask, ctx.Task, nil, nil); err != nil {
 		t.Fatalf("unexpected error registering task: %v", err)
 	}
 	if err := ctx.syncOnce(); err != nil {
@@ -383,7 +383,7 @@ func TestConsul_ChangePorts(t *testing.T) {
 			// Removed PortLabel; should default to service's (y)
 		},
 	}
-	if err := ctx.ServiceClient.UpdateTask("allocid", origTask, ctx.Task, ctx); err != nil {
+	if err := ctx.ServiceClient.UpdateTask("allocid", origTask, ctx.Task, ctx, nil); err != nil {
 		t.Fatalf("unexpected error registering task: %v", err)
 	}
 	if err := ctx.syncOnce(); err != nil {
@@ -829,7 +829,7 @@ func TestConsul_CancelScript(t *testing.T) {
 		},
 	}
 
-	if err := ctx.ServiceClient.UpdateTask("allocid", origTask, ctx.Task, ctx); err != nil {
+	if err := ctx.ServiceClient.UpdateTask("allocid", origTask, ctx.Task, ctx, nil); err != nil {
 		t.Fatalf("unexpected error registering task: %v", err)
 	}
 
@@ -912,8 +912,8 @@ func TestConsul_DriverNetwork_AutoUse(t *testing.T) {
 			"x": 8888,
 			"y": 9999,
 		},
-		IP:        "172.18.0.2",
-		AutoUseIP: true,
+		IP:            "172.18.0.2",
+		AutoAdvertise: true,
 	}
 
 	if err := ctx.ServiceClient.RegisterTask("allocid", ctx.Task, ctx, net); err != nil {
@@ -931,7 +931,7 @@ func TestConsul_DriverNetwork_AutoUse(t *testing.T) {
 	for _, v := range ctx.FakeConsul.services {
 		switch v.Name {
 		case ctx.Task.Services[0].Name: // x
-			// Since DriverNetwork.AutoUseIP=true, driver ports should be used
+			// Since DriverNetwork.AutoAdvertise=true, driver ports should be used
 			if v.Port != net.PortMap["x"] {
 				t.Errorf("expected service %s's port to be %d but found %d",
 					v.Name, net.PortMap["x"], v.Port)
@@ -1000,8 +1000,8 @@ func TestConsul_DriverNetwork_NoAutoUse(t *testing.T) {
 			"x": 8888,
 			"y": 9999,
 		},
-		IP:        "172.18.0.2",
-		AutoUseIP: false,
+		IP:            "172.18.0.2",
+		AutoAdvertise: false,
 	}
 
 	if err := ctx.ServiceClient.RegisterTask("allocid", ctx.Task, ctx, net); err != nil {
@@ -1013,13 +1013,13 @@ func TestConsul_DriverNetwork_NoAutoUse(t *testing.T) {
 	}
 
 	if n := len(ctx.FakeConsul.services); n != 3 {
-		t.Fatalf("expected 2 services but found: %d", n)
+		t.Fatalf("expected 3 services but found: %d", n)
 	}
 
 	for _, v := range ctx.FakeConsul.services {
 		switch v.Name {
 		case ctx.Task.Services[0].Name: // x + auto
-			// Since DriverNetwork.AutoUseIP=false, host ports should be used
+			// Since DriverNetwork.AutoAdvertise=false, host ports should be used
 			if v.Port != xPort {
 				t.Errorf("expected service %s's port to be %d but found %d",
 					v.Name, xPort, v.Port)
@@ -1043,4 +1043,76 @@ func TestConsul_DriverNetwork_NoAutoUse(t *testing.T) {
 			t.Errorf("unexpected service name: %q", v.Name)
 		}
 	}
+}
+
+// TestConsul_DriverNetwork_Change asserts that if a driver network is
+// specified and a service updates its use its properly updated in Consul.
+func TestConsul_DriverNetwork_Change(t *testing.T) {
+	ctx := setupFake()
+
+	ctx.Task.Services = []*structs.Service{
+		{
+			Name:        "service-foo",
+			PortLabel:   "x",
+			AddressMode: structs.AddressModeAuto,
+		},
+	}
+
+	net := &cstructs.DriverNetwork{
+		PortMap: map[string]int{
+			"x": 8888,
+			"y": 9999,
+		},
+		IP:            "172.18.0.2",
+		AutoAdvertise: false,
+	}
+
+	syncAndAssertPort := func(port int) {
+		if err := ctx.syncOnce(); err != nil {
+			t.Fatalf("unexpected error syncing task: %v", err)
+		}
+
+		if n := len(ctx.FakeConsul.services); n != 1 {
+			t.Fatalf("expected 1 service but found: %d", n)
+		}
+
+		for _, v := range ctx.FakeConsul.services {
+			switch v.Name {
+			case ctx.Task.Services[0].Name:
+				if v.Port != port {
+					t.Errorf("expected service %s's port to be %d but found %d",
+						v.Name, port, v.Port)
+				}
+			default:
+				t.Errorf("unexpected service name: %q", v.Name)
+			}
+		}
+	}
+
+	// Initial service should advertise host port x
+	if err := ctx.ServiceClient.RegisterTask("allocid", ctx.Task, ctx, net); err != nil {
+		t.Fatalf("unexpected error registering task: %v", err)
+	}
+
+	syncAndAssertPort(xPort)
+
+	// UpdateTask to use Host (shouldn't change anything)
+	orig := ctx.Task.Copy()
+	ctx.Task.Services[0].AddressMode = structs.AddressModeHost
+
+	if err := ctx.ServiceClient.UpdateTask("allocid", orig, ctx.Task, ctx, net); err != nil {
+		t.Fatalf("unexpected error updating task: %v", err)
+	}
+
+	syncAndAssertPort(xPort)
+
+	// UpdateTask to use Driver (*should* change IP and port)
+	orig = ctx.Task.Copy()
+	ctx.Task.Services[0].AddressMode = structs.AddressModeDriver
+
+	if err := ctx.ServiceClient.UpdateTask("allocid", orig, ctx.Task, ctx, net); err != nil {
+		t.Fatalf("unexpected error updating task: %v", err)
+	}
+
+	syncAndAssertPort(net.PortMap["x"])
 }
