@@ -458,6 +458,11 @@ func (c *ServiceClient) serviceRegs(ops *operations, allocID string, service *st
 	// with tests that may reuse Tasks
 	copy(serviceReg.Tags, service.Tags)
 	ops.regServices = append(ops.regServices, serviceReg)
+	return c.checkRegs(ops, allocID, id, service, task, exec, net)
+}
+
+func (c *ServiceClient) checkRegs(ops *operations, allocID, serviceID string, service *structs.Service,
+	task *structs.Task, exec driver.ScriptExecutor, net *cstructs.DriverNetwork) error {
 
 	for _, check := range service.Checks {
 		if check.TLSSkipVerify && !c.skipVerifySupport {
@@ -465,7 +470,7 @@ func (c *ServiceClient) serviceRegs(ops *operations, allocID string, service *st
 				check.Name, task.Name, allocID)
 			continue
 		}
-		checkID := makeCheckID(id, check)
+		checkID := makeCheckID(serviceID, check)
 		if check.Type == structs.ServiceCheckScript {
 			if exec == nil {
 				return fmt.Errorf("driver doesn't support script checks")
@@ -476,14 +481,13 @@ func (c *ServiceClient) serviceRegs(ops *operations, allocID string, service *st
 		}
 
 		// Checks should always use the host ip:port
-		//FIXME right?!
 		portLabel := check.PortLabel
 		if portLabel == "" {
 			// Default to the service's port label
 			portLabel = service.PortLabel
 		}
 		ip, port := task.Resources.Networks.Port(portLabel)
-		checkReg, err := createCheckReg(id, checkID, check, ip, port)
+		checkReg, err := createCheckReg(serviceID, checkID, check, ip, port)
 		if err != nil {
 			return fmt.Errorf("failed to add check %q: %v", check.Name, err)
 		}
@@ -541,7 +545,8 @@ func (c *ServiceClient) UpdateTask(allocID string, existing, newTask *structs.Ta
 
 		// PortLabel and AddressMode aren't included in the ID, so we
 		// have to compare manually.
-		if newSvc.PortLabel == existingSvc.PortLabel && newSvc.AddressMode == existingSvc.AddressMode {
+		serviceUnchanged := newSvc.PortLabel == existingSvc.PortLabel && newSvc.AddressMode == existingSvc.AddressMode
+		if serviceUnchanged {
 			// Service exists and hasn't changed, don't add it later
 			delete(newIDs, existingID)
 		}
@@ -558,6 +563,12 @@ func (c *ServiceClient) UpdateTask(allocID string, existing, newTask *structs.Ta
 			if _, exists := existingChecks[checkID]; exists {
 				// Check exists, so don't remove it
 				delete(existingChecks, checkID)
+			} else if serviceUnchanged {
+				// New check on an unchanged service; add them now
+				err := c.checkRegs(ops, allocID, existingID, newSvc, newTask, exec, net)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
